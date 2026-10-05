@@ -34,7 +34,6 @@ from pixelator.common.utils import logger
 
 if TYPE_CHECKING:
     from pixelator.pna.config.config_class import PNAConfig
-    from pixelator.pna.pixeldataset.dataset import PNAPixelDataset
 
 # Trailing ``-<digits>`` is the hash group (``B2M-1`` → ``B2M``). The same
 # pattern matches ordinary names such as ``PD-1``, so it is only applied to
@@ -194,60 +193,27 @@ class PNAAntibodyPanel:
         return cls(df, metadata, file_name=panel_file.name, filepath=panel_file)
 
     @classmethod
-    def from_pxl_dataset(
-        cls, pxl_data: PNAPixelDataset, file_name: Optional[str] = None
+    def from_legacy_var(
+        cls,
+        var: pd.DataFrame,
+        panel_metadata: dict,
+        *,
+        file_name: str | None = None,
     ) -> Self:
-        """Create an AntibodyPanel from a pxl dataset.
+        """Build a panel from a pixelator 0.22.0 through 0.30.0 ``var`` table.
 
-        Args:
-            pxl_data: A PNAPixelDataset object.
-            file_name: The optional name of the file from which the pxl dataset was loaded.
-
-        Returns:
-            The AntibodyPanel object. (AntibodyPanel)
-
-        Raises:
-            KeyError: exception if panel information is missing in the pxl dataset,
+        ``panel_metadata`` is the ``uns['panel_metadata']`` entry, and ``var``
+        is indexed by marker id. Those releases wrote ``panel_columns`` and
+        the columns it names together.
         """
-        logger.debug("Creating Antibody panel from PNAPixelDataset object")
-        adata = pxl_data.adata()
-        panel = cls.from_adata(adata, file_name=file_name)
-        logger.debug("Antibody panel from PNAPixelDataset created")
-        return panel
-
-    @classmethod
-    def from_adata(cls, adata: AnnData, file_name: Optional[str] = None) -> Self:
-        """Create an AntibodyPanel from an AnnData object.
-
-        Args:
-            adata: An AnnData object containing panel information.
-            file_name: The optional name of the file from which the AnnData object was loaded.
-
-        Returns:
-            The AntibodyPanel object. (AntibodyPanel)
-
-        Raises:
-            KeyError: exception if panel information is missing in the AnnData object.
-        """
-        logger.debug("Creating Antibody panel from AnnData object")
-        try:
-            panel_metadata = adata.uns["panel_metadata"]
-        except KeyError as err:
-            logger.error(  # pylint: disable=logging-not-lazy
-                f"The provided AnnData object does not contain {err}. "
-                + "Please, regenerate your data with the most recent version of pixelator."
-            )
-            raise
-        panel_columns = panel_metadata.get("panel_columns")
-        if not panel_columns:
-            raise KeyError(
-                "The provided AnnData object does not contain panel columns information in the metadata. "
-                + "Please, regenerate your data with the most recent version of pixelator."
-            )
-        df = adata.var[panel_columns]
+        df = var[list(panel_metadata["panel_columns"])]
+        # Sample calling can leave a collapsed hashing id in var. That row is
+        # not a panel marker, so its panel columns are empty.
+        if "sequence_1" in df.columns:
+            df = df[df["sequence_1"].notna()].copy()
+        if "control" in df.columns and df["control"].dtype != bool:
+            df["control"] = df["control"].fillna(False).astype(bool)
         metadata = AntibodyPanelMetadata.model_validate(panel_metadata)
-
-        logger.debug("Antibody panel from AnnData object created")
         return cls(df, metadata, file_name=file_name)
 
     @classmethod
@@ -957,61 +923,6 @@ class PNAAntibodyPanelDiff:
             if str(old) != str(new):
                 mapping[str(old)] = str(new)
         return mapping
-
-    def upgrade_adata(self, adata: AnnData) -> AnnData:
-        """Upgrade an AnnData object with the changes between the two panels.
-
-        Args:
-            adata: An AnnData object containing panel information.
-        """
-        adata_panel = PNAAntibodyPanel.from_adata(adata)
-        if self.panel_1 != adata_panel:
-            raise ValueError(
-                "The provided AnnData object does not match the panel. Cannot upgrade."
-                f"Expected panel {self.panel_2.name} v{self.panel_2.version}, but got panel {adata_panel.name} v{adata_panel.version}."
-            )
-
-        non_panel_columns = adata.var.copy()[
-            [
-                col
-                for col in adata.var.columns
-                if col not in adata.uns["panel_metadata"]["panel_columns"]
-            ]
-            + self.join_on_columns
-        ]
-        adata.var = (
-            self.joined.select(
-                list(
-                    set(
-                        self.join_on_columns
-                        + self.identical_columns
-                        + [f"{col}_panel_2" for col in self.changed_columns]
-                        + self.added_columns
-                    )
-                )
-            )
-            .rename({f"{col}_panel_2": col for col in self.changed_columns})
-            # keep order and append new to the end
-            .select(
-                ["marker_id"]  # index not in panel_metadata panel_columns below
-                + adata.uns["panel_metadata"]["panel_columns"]
-                + self.added_columns
-            )
-            .to_pandas()
-            .set_index("marker_id")
-        )
-        if adata.var.shape[0] != non_panel_columns.shape[0]:
-            raise ValueError(
-                "Row count mismatch in automatic patch panel patch version bump."
-            )
-        adata.var = adata.var.join(
-            non_panel_columns.set_index(self.join_on_columns),
-            how="outer",
-            on=self.join_on_columns,
-        )
-        adata.uns["panel_metadata"] = self.panel_2.metadata.model_dump()
-        adata.uns["panel_metadata"]["panel_columns"] = self.panel_2.df.columns.tolist()
-        return adata
 
 
 def sample_calling_hashing_collapsed(
