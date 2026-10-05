@@ -6,6 +6,7 @@ Copyright © 2022 Pixelgen Technologies AB.
 from __future__ import annotations
 
 import json
+import os
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
@@ -778,6 +779,20 @@ def load_antibody_panel(config: PNAConfig, panel: PathType) -> PNAAntibodyPanel:
 
     panel_obj = PNAAntibodyPanel.from_csv(panel)
     return panel_obj
+
+
+def load_antibody_panels(
+    config: PNAConfig, panels: PathType | Sequence[PathType]
+) -> PNAAntibodyPanel:
+    """Load one or more panels and concatenate them.
+
+    A single path or name is returned as that panel. Several inputs are
+    concatenated in order.
+    """
+    if isinstance(panels, (str, os.PathLike)):
+        return load_antibody_panel(config, panels)
+    loaded = [load_antibody_panel(config, panel) for panel in panels]
+    return PNAAntibodyPanel.concatenate(loaded)
 
 
 class PNAAntibodyPanelDiff:
