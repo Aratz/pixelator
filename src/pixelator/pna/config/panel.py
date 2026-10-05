@@ -6,9 +6,10 @@ Copyright © 2022 Pixelgen Technologies AB.
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Set
+from typing import TYPE_CHECKING, List, Optional, Sequence, Set
 
 from anndata import AnnData
 
@@ -37,6 +38,15 @@ if TYPE_CHECKING:
 # pattern matches ordinary names such as ``PD-1``, so it is only applied to
 # rows already flagged by ``sample_hashing``.
 _HASHING_MARKER_ID_RE = re.compile(r"^(?P<base>.+)-(?P<index>\d+)$")
+
+
+@dataclass(frozen=True)
+class PanelSource:
+    """One panel file that contributed markers to a ``PNAAntibodyPanel``."""
+
+    metadata: AntibodyPanelMetadata
+    file_name: str | None = None
+    filepath: str | None = None
 
 
 def sample_hashing_mask(sample_hashing: pd.Series) -> pd.Series:
@@ -89,27 +99,60 @@ class PNAAntibodyPanel:
     def __init__(
         self,
         df: pd.DataFrame,
-        metadata: AntibodyPanelMetadata,
+        metadata: AntibodyPanelMetadata | None = None,
         file_name: Optional[str] = None,
         filepath: Optional[PathType] = None,
+        *,
+        sources: list[PanelSource] | None = None,
+        marker_source_ids: pd.Series | None = None,
     ) -> None:
-        """Load a panel from a dataframe and metadata.
+        """Build a panel from a marker table.
+
+        Pass ``metadata`` or ``sources``, not both. ``metadata`` becomes one
+        source, using ``file_name`` and ``filepath``. Pass ``sources`` for a
+        panel that already names its files. The ``metadata`` property returns
+        that entry only when the panel has one source.
 
         Args:
-            df: The dataframe containing the panel information.
-            metadata: The metadata for the panel.
-            file_name: The optional basename of the file from which the panel is loaded.
-            filepath: The optional full path of the file from which the panel is loaded.
+            df: Marker table, indexed by marker id.
+            metadata: Metadata for the single source. Omit when passing
+                ``sources``.
+            file_name: Basename of the file this panel was loaded from.
+            filepath: Full path of the file this panel was loaded from.
+            sources: Panel files that contributed markers. Omit when passing
+                ``metadata``.
+            marker_source_ids: Source index for each marker. Required when
+                there is more than one source.
 
-        Returns:
-            None
         Raises:
-            AssertionError: exception if panel file is missing, invalid or with incorrect format
+            ValueError: If both ``metadata`` and ``sources`` are omitted or
+                both are given, or if several sources are given without
+                ``marker_source_ids``.
+            AssertionError: If the marker table fails panel validation.
         """
         self._filename = file_name
         self._filepath: Optional[Path] = Path(filepath).resolve() if filepath else None
-        self.metadata = metadata
         self._df = df
+        if sources is not None and metadata is not None:
+            raise ValueError("Pass metadata or sources, not both.")
+        if sources is None:
+            if metadata is None:
+                raise ValueError("Pass metadata or sources.")
+            sources = [
+                PanelSource(
+                    metadata=metadata,
+                    file_name=file_name,
+                    filepath=str(self._filepath) if self._filepath else None,
+                )
+            ]
+        self.sources: list[PanelSource] = list(sources)
+        if marker_source_ids is None:
+            if len(self.sources) > 1:
+                raise ValueError(
+                    "marker_source_ids is required when a panel has multiple sources."
+                )
+            marker_source_ids = pd.Series(0, index=df.index, dtype="int64")
+        self._marker_source_ids = marker_source_ids
 
         # validate the panel
         errors = self.validate_antibody_panel(df)
@@ -205,47 +248,201 @@ class PNAAntibodyPanel:
         logger.debug("Antibody panel from AnnData object created")
         return cls(df, metadata, file_name=file_name)
 
+    @classmethod
+    def concatenate(cls, panels: Sequence[PNAAntibodyPanel]) -> PNAAntibodyPanel:
+        """Concatenate panels into one panel.
+
+        One panel is returned unchanged. Several panels are stacked in the
+        given order. The result keeps every input source.
+        ``marker_id``, ``sequence_1``, and ``sequence_2`` must be unique
+        across the concatenation. An optional column present on only some
+        sources is blank on the others, the same as an empty cell in a panel CSV.
+        """
+        if not panels:
+            raise ValueError("At least one panel is required to concatenate.")
+        if len(panels) == 1:
+            return panels[0]
+
+        frames: list[pd.DataFrame] = []
+        sources: list[PanelSource] = []
+        source_id_frames: list[pd.Series] = []
+        for panel in panels:
+            if not panel.sources:
+                raise ValueError("Cannot concatenate a panel that has no sources.")
+            for source_index, source in enumerate(panel.sources):
+                new_source_id = len(sources)
+                sources.append(source)
+                marker_index = panel.marker_source_ids.index[
+                    panel.marker_source_ids == source_index
+                ]
+                part = panel.df.loc[list(marker_index)]
+                frames.append(part)
+                source_id_frames.append(
+                    pd.Series(new_source_id, index=part.index, dtype="int64")
+                )
+
+        df = pd.concat(cls._align_optional_columns(frames))
+        df.index.name = cls._INDEX_COLUMN
+        if "control" in df.columns:
+            df["control"] = df["control"].map(
+                lambda value: bool(value) if pd.notna(value) else False
+            )
+        marker_source_ids = pd.concat(source_id_frames)
+        marker_source_ids.index = df.index
+        return cls(
+            df,
+            sources=sources,
+            marker_source_ids=marker_source_ids.astype("int64"),
+        )
+
+    @staticmethod
+    def _align_optional_columns(frames: list[pd.DataFrame]) -> list[pd.DataFrame]:
+        """Give every frame the same columns before they are stacked.
+
+        ``pd.concat`` inserts NaN where a column exists on only some frames.
+        A blank UniProt id is an empty string, and a missing hashing flag is
+        false. Filling after the stack mixes those types and breaks validation.
+        """
+        columns = list(
+            dict.fromkeys(column for frame in frames for column in frame.columns)
+        )
+        missing_on_some = [
+            column
+            for column in columns
+            if any(column not in frame.columns for frame in frames)
+        ]
+        if not missing_on_some:
+            return frames
+        fills = {
+            column: PNAAntibodyPanel._missing_optional_value(frames, column)
+            for column in missing_on_some
+        }
+        aligned: list[pd.DataFrame] = []
+        for frame in frames:
+            missing = {
+                column: fill
+                for column, fill in fills.items()
+                if column not in frame.columns
+            }
+            if not missing:
+                aligned.append(frame)
+                continue
+            extra = pd.DataFrame(missing, index=frame.index)
+            aligned.append(pd.concat([frame, extra], axis=1))
+        return aligned
+
+    @staticmethod
+    def _missing_optional_value(frames: list[pd.DataFrame], column: str):
+        """Return the blank value for a column some sources do not have."""
+        if column == "control":
+            return False
+        present = [
+            frame[column].dropna() for frame in frames if column in frame.columns
+        ]
+        values = pd.concat(present) if present else pd.Series(dtype=object)
+        if values.empty:
+            return ""
+        if pd.api.types.is_bool_dtype(values) or all(
+            isinstance(value, bool) for value in values
+        ):
+            return False
+        if pd.api.types.is_numeric_dtype(values):
+            return 0
+        return ""
+
+    def _single_metadata(self) -> AntibodyPanelMetadata | None:
+        """Return metadata when this panel has exactly one source."""
+        if len(self.sources) != 1:
+            return None
+        return self.sources[0].metadata
+
+    def _require_single_metadata(self, field: str) -> AntibodyPanelMetadata:
+        """Return the only source metadata, refusing a concatenated panel."""
+        metadata = self._single_metadata()
+        if metadata is None:
+            raise ValueError(
+                f"Panel {field} is only available for a single source. "
+                "Read it from each entry in sources."
+            )
+        return metadata
+
+    @property
+    def metadata(self) -> AntibodyPanelMetadata:
+        """Metadata for the only source in this panel.
+
+        Raises:
+            ValueError: When this panel does not have exactly one source.
+                Read ``sources`` instead.
+        """
+        return self._require_single_metadata("metadata")
+
     @property
     def name(self) -> str:
-        """Panel name from metadata.
+        """Panel name.
 
-        Returns:
-            The panel name.
+        Raises:
+            ValueError: When this panel does not have exactly one source.
+                Read ``sources`` instead.
         """
-        return self.metadata.name
+        return self._require_single_metadata("name").name
 
     @property
     def product(self) -> Optional[str]:
         """Product identifier from metadata, if present.
 
         Returns:
-            Product name, or None when not provided in panel metadata.
+            Product name, or None when the single source does not set one.
+
+        Raises:
+            ValueError: When this panel does not have exactly one source.
+                Read ``sources`` instead.
         """
-        return self.metadata.product
+        return self._require_single_metadata("product").product
 
     @property
     def version(self) -> str:
-        """Panel version from metadata.
+        """Panel version.
 
-        Returns:
-            Semantic version string for this panel.
+        Raises:
+            ValueError: When this panel does not have exactly one source.
+                Read ``sources`` instead.
         """
-        return self.metadata.version
+        return self._require_single_metadata("version").version
 
     @property
     def description(self) -> Optional[str]:
-        """Return the panel file description."""
-        return self.metadata.description
+        """Return the panel file description.
+
+        Raises:
+            ValueError: When this panel does not have exactly one source.
+                Read ``sources`` instead.
+        """
+        return self._require_single_metadata("description").description
 
     @property
     def aliases(self) -> list[str]:
-        """Return the (optional) list of panel file aliases."""
-        return self.metadata.aliases
+        """Return the (optional) list of panel file aliases.
+
+        Raises:
+            ValueError: When this panel does not have exactly one source.
+                Read ``sources`` instead.
+        """
+        return self._require_single_metadata("aliases").aliases
 
     @property
     def archived(self) -> Optional[bool]:
-        """Return whether the panel is marked as archived."""
-        return self.metadata.archived
+        """Return whether the panel is marked as archived.
+
+        Raises:
+            ValueError: When this panel does not have exactly one source.
+                Read ``sources`` instead.
+        """
+        return self._require_single_metadata("archived").archived
+
+    @property
+    def marker_source_ids(self) -> pd.Series:
+        """Return the panel-source index of each marker."""
+        return self._marker_source_ids
 
     @property
     def hashing_marker_ids(self) -> set[str]:
@@ -301,6 +498,63 @@ class PNAAntibodyPanel:
     def filepath(self) -> Optional[Path]:
         """Return the full path of the marker panel file, if any."""
         return self._filepath
+
+    def copy(self) -> Self:
+        """Return a shallow copy with its own marker table and source list."""
+        return type(self)(
+            self.df.copy(),
+            file_name=self.filename,
+            filepath=self.filepath,
+            sources=list(self.sources),
+            marker_source_ids=self.marker_source_ids.copy(),
+        )
+
+    def source_as_panel(self, source_index: int) -> Self:
+        """Return one source as its own single-source panel."""
+        source = self.sources[source_index]
+        marker_index = self.marker_source_ids.index[
+            self.marker_source_ids == source_index
+        ]
+        df = self.df.loc[list(marker_index)].copy()
+        return type(self)(
+            df,
+            source.metadata,
+            file_name=source.file_name,
+            filepath=source.filepath,
+        )
+
+    def replace_source(self, source_index: int, replacement: PNAAntibodyPanel) -> Self:
+        """Return a copy with one source replaced by a single-source panel.
+
+        An optional column present on only one side is blank on the other,
+        the same as an empty cell in a panel CSV.
+        """
+        if len(replacement.sources) != 1:
+            raise ValueError("Replacement panel must come from a single source.")
+        keep = self.marker_source_ids.index[self.marker_source_ids != source_index]
+        kept = self.df.loc[list(keep)]
+        if kept.empty:
+            df = replacement.df.copy()
+        else:
+            kept, incoming = self._align_optional_columns([kept, replacement.df])
+            df = pd.concat([kept, incoming])
+        df.index.name = self._INDEX_COLUMN
+        source_ids = pd.concat(
+            [
+                self.marker_source_ids.loc[list(keep)],
+                pd.Series(source_index, index=replacement.df.index, dtype="int64"),
+            ]
+        )
+        sources = list(self.sources)
+        sources[source_index] = replacement.sources[0]
+        single_source = len(sources) == 1
+        return type(self)(
+            df,
+            file_name=self.filename if single_source else None,
+            filepath=self.filepath if single_source else None,
+            sources=sources,
+            marker_source_ids=source_ids.astype("int64"),
+        )
 
     @cached_property
     def size(self) -> int:
@@ -467,15 +721,43 @@ class PNAAntibodyPanel:
         """Convert the panel to a Polars DataFrame."""
         return pl.from_pandas(self.df, include_index=True)
 
+    def _source_marker_groups(
+        self,
+    ) -> list[tuple[AntibodyPanelMetadata, frozenset[str]]]:
+        """Return each source with its marker ids, independent of source order."""
+        groups = []
+        for source_index, source in enumerate(self.sources):
+            marker_ids = frozenset(
+                str(marker_id)
+                for marker_id in self.marker_source_ids.index[
+                    self.marker_source_ids == source_index
+                ]
+            )
+            groups.append((source.metadata, marker_ids))
+        return sorted(
+            groups,
+            key=lambda group: (group[0].model_dump_json(), tuple(sorted(group[1]))),
+        )
+
     def __eq__(self, other: object) -> bool:
-        """Check if two panels are equal based on their dataframes and metadata.
+        """Return whether two panels describe the same sources and markers.
+
+        Row order, column order, source order, and the file a source was
+        loaded from are ignored. Each marker must still belong to the same
+        source.
 
         Args:
             other: Panel to compare for equality.
         """
         if not isinstance(other, PNAAntibodyPanel):
             raise ValueError("Can only compare with another PNAAntibodyPanel")
-        return self.df.equals(other.df) and self.metadata == other.metadata
+        if self._source_marker_groups() != other._source_marker_groups():
+            return False
+        left = self.df.sort_index()
+        right = other.df.sort_index()
+        if set(left.columns) != set(right.columns):
+            return False
+        return left.equals(right[list(left.columns)])
 
 
 def load_antibody_panel(config: PNAConfig, panel: PathType) -> PNAAntibodyPanel:
@@ -509,7 +791,15 @@ class PNAAntibodyPanelDiff:
         Args:
             panel_1: The first panel to compare.
             panel_2: The second panel to compare.
+
+        Raises:
+            ValueError: When either panel does not have exactly one source.
         """
+        if len(panel_1.sources) != 1 or len(panel_2.sources) != 1:
+            raise ValueError(
+                "PNAAntibodyPanelDiff only compares panels with a single source. "
+                "Split a concatenated panel with source_as_panel first."
+            )
         self.panel_1 = panel_1
         self.panel_2 = panel_2
 
@@ -646,6 +936,25 @@ class PNAAntibodyPanelDiff:
                 for col_name in self.panel_2.to_polars().columns
             ]
         )
+
+    def changed_marker_ids(self) -> dict[str, str]:
+        """Return ``old marker_id -> new marker_id`` for markers whose id changed."""
+        if (
+            "marker_id" not in self.joined.columns
+            or "marker_id_panel_2" not in self.joined.columns
+        ):
+            return {}
+        both = self.joined.filter(
+            pl.col("marker_id").is_not_null()
+            & pl.col("marker_id_panel_2").is_not_null()
+        )
+        mapping: dict[str, str] = {}
+        for old, new in zip(
+            both["marker_id"].to_list(), both["marker_id_panel_2"].to_list()
+        ):
+            if str(old) != str(new):
+                mapping[str(old)] = str(new)
+        return mapping
 
     def upgrade_adata(self, adata: AnnData) -> AnnData:
         """Upgrade an AnnData object with the changes between the two panels.
